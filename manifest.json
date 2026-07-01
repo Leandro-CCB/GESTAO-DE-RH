@@ -1,0 +1,26 @@
+{
+  "name": "RH Benefícios — Gestão Completa",
+  "short_name": "RH Benefícios",
+  "description": "Sistema de gestão de RH: funcionários, lançamentos, pagamentos, férias, encargos, atestados, comissões e falta de valores.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f8fafc",
+  "theme_color": "#4f46e5",
+  "lang": "pt-BR",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
