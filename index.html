@@ -14,7 +14,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import {
-    getFirestore, collection, doc, getDocs, setDoc, deleteDoc, getDoc
+    getFirestore, collection, doc, getDocs, setDoc, deleteDoc, getDoc, writeBatch
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -31,7 +31,7 @@
 
   // ── Expõe ao escopo global ──────────────────────────────────────────────────
   window._db = db;
-  window._fsLib = { collection, doc, getDocs, setDoc, deleteDoc, getDoc };
+  window._fsLib = { collection, doc, getDocs, setDoc, deleteDoc, getDoc, writeBatch };
 
   // ── Carrega dados do Firestore e inicializa o app ──────────────────────────
   async function loadFromFirestore() {
@@ -2183,6 +2183,16 @@ input:checked + .slider:before{transform:translateX(22px)}
       <select class="at-sel" id="fv-emp-filt" onchange="renderFaltas()">
         <option value="">Todas as empresas</option>
       </select>
+      <select class="at-sel" id="fv-mes-filt" onchange="renderFaltas()">
+        <option value="">Todos os meses</option>
+        <option value="1">Janeiro</option><option value="2">Fevereiro</option><option value="3">Março</option>
+        <option value="4">Abril</option><option value="5">Maio</option><option value="6">Junho</option>
+        <option value="7">Julho</option><option value="8">Agosto</option><option value="9">Setembro</option>
+        <option value="10">Outubro</option><option value="11">Novembro</option><option value="12">Dezembro</option>
+      </select>
+      <select class="at-sel" id="fv-ano-filt" onchange="renderFaltas()">
+        <option value="">Todos os anos</option>
+      </select>
     </div>
     <div style="display:flex;gap:10px">
       <button class="btn bw" onclick="gerarFichaFaltaPDF()" style="display:flex;align-items:center;gap:7px">
@@ -2197,7 +2207,7 @@ input:checked + .slider:before{transform:translateX(22px)}
   </div>
 
   <div class="alert" style="background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:10px;padding:10px 14px;font-size:12px;margin-bottom:18px">
-    ℹ️ Selecione um <strong>funcionário</strong> no filtro acima e clique em <strong>"Gerar Ficha em PDF"</strong> para emitir a Ficha de Registro de Falta de Valores somente com os lançamentos daquele funcionário.
+    ℹ️ Selecione um <strong>funcionário</strong> e, se desejar, um <strong>mês/ano de referência</strong> no filtro acima e clique em <strong>"Gerar Ficha em PDF"</strong> para emitir a Ficha de Registro de Falta de Valores somente com os lançamentos daquele funcionário (e do período selecionado, quando informado).
   </div>
 
   <div class="at-stats" id="fv-stats-row">
@@ -2829,6 +2839,45 @@ async function fbRemove(colecao, id){
   }
 }
 
+// Sincroniza uma coleção inteira via writeBatch do Firestore (bem mais rápido e
+// confiável que apagar/gravar documento por documento — usado na importação de backup).
+// Faz DELETE de tudo que estava na coleção antes e SET de todos os itens novos,
+// em lotes de até 450 operações (limite do Firestore é 500 por batch).
+async function fbBatchSync(colecao, itensAntigos, itensNovos){
+  if(!fbAvailable()) return { ok:false, motivo:'offline' };
+  const { doc, writeBatch } = window._fsLib;
+  const LIMITE = 450;
+  const sanitiza = (dados) => JSON.parse(JSON.stringify(dados, (k, v) => {
+    if (v === undefined) return null;
+    if (typeof v === 'number' && isNaN(v)) return 0;
+    return v;
+  }));
+  // Monta lista de operações: primeiro deletes dos antigos que não estão mais
+  // nos novos (evita apagar e recriar o mesmo id à toa), depois sets dos novos.
+  const idsNovos = new Set(itensNovos.map(i=>i.id));
+  const paraDeletar = itensAntigos.filter(i=>!idsNovos.has(i.id));
+  const ops = [
+    ...paraDeletar.map(i=>({ tipo:'delete', id:i.id })),
+    ...itensNovos.map(i=>({ tipo:'set', id:i.id, dados:sanitiza(i) }))
+  ];
+  try{
+    for(let i=0; i<ops.length; i+=LIMITE){
+      const chunk = ops.slice(i, i+LIMITE);
+      const batch = writeBatch(window._db);
+      for(const op of chunk){
+        const ref = doc(window._db, colecao, op.id);
+        if(op.tipo==='delete') batch.delete(ref);
+        else batch.set(ref, op.dados);
+      }
+      await batch.commit();
+    }
+    return { ok:true };
+  }catch(e){
+    console.error('[FB] ❌ Erro no batch sync de "'+colecao+'":', e.code || e.message, e);
+    return { ok:false, motivo:e.code||e.message };
+  }
+}
+
 // Funções específicas — todas usam fbWrite/fbRemove
 async function fbSaveFunc(f)    { return fbWrite('funcionarios', f.id, f); }
 async function fbDeleteFunc(id) { return fbRemove('funcionarios', id); }
@@ -3402,16 +3451,22 @@ async function salvarLanc(){
   const vtuD=parseFloat($('c-vt').value)||config.vt;
   // Remove lançamentos VR/VT do mesmo período antes de salvar
   const toDelete=lancamentos.filter(l=>l.mes===mes&&l.ano===ano&&(!l.tipo||l.tipo==='vrvt'));
-  for(const l of toDelete){ await fbDeleteLanc(l.id); }
   lancamentos=lancamentos.filter(l=>!(l.mes===mes&&l.ano===ano&&(!l.tipo||l.tipo==='vrvt')));
   const novos=calcRows.map(r=>({id:uid(),mes,ano,tipo:'vrvt',funcId:r.func.id,funcNome:r.func.nome,funcEscala:r.func.escala,funcEmp:r.func.empresa||'',
     dVR:r.dVR,dVT:r.dVT,vru:vruD,vtu:vtuD,vr:r.vr,vt:r.vt,total:r.total}));
   lancamentos.push(...novos);
+  // Salva local + tela IMEDIATAMENTE, antes de mexer no Firebase — assim os
+  // lançamentos nunca ficam "invisíveis" mesmo se a sincronização na nuvem falhar.
   lsL();
-  for(const l of novos){ await fbSaveLanc(l); }
+  renderLanc();
   toast(`${calcRows.length} lançamentos salvos para ${MESES[mes]}/${ano}!`);
   showSavePopup(`${calcRows.length} lançamento(s) de VR/VT salvos para ${MESES[mes]}/${ano}!`);
   updateDash();
+  // Sincroniza com o Firebase em paralelo (não sequencial) em segundo plano.
+  if(fbAvailable()){
+    Promise.all([...toDelete.map(l=>fbDeleteLanc(l.id)), ...novos.map(l=>fbSaveLanc(l))])
+      .catch(e=>console.error('[FB] erro ao sincronizar VR/VT:',e));
+  }
 }
 
 // ─── VR e VT MODAL (acessado pela aba Pagamentos) ─────────────────────────────
@@ -3585,18 +3640,18 @@ async function salvarVRVTModal(){
     if(jaExiste){
       if(!confirm(`⚠️ Já existe lançamento VR/VT para ${filtFunc} em ${MESES[mes]}/${ano}.\n\nDeseja substituir?`)) return;
       // Remove só o registro desse funcionário
-      const toDelete=existentes.filter(l=>l.funcNome===filtFunc);
-      for(const l of toDelete){await fbDeleteLanc(l.id);}
+      var toDelete=existentes.filter(l=>l.funcNome===filtFunc);
       lancamentos=lancamentos.filter(l=>!(l.mes===mes&&l.ano===ano&&(!l.tipo||l.tipo==='vrvt')&&l.funcNome===filtFunc));
     }
   } else {
     // Sem filtro — verifica se há lançamentos do período completo
     if(existentes.length){
       if(!confirm(`⚠️ Já existem ${existentes.length} lançamento(s) VR/VT para ${MESES[mes]}/${ano}.\n\nDeseja substituir todos?`)) return;
-      for(const l of existentes){await fbDeleteLanc(l.id);}
+      var toDelete=existentes;
       lancamentos=lancamentos.filter(l=>!(l.mes===mes&&l.ano===ano&&(!l.tipo||l.tipo==='vrvt')));
     }
   }
+  toDelete = toDelete || [];
 
   const novos=mvcRows.filter(r=>r.total>0||r.dVR>0||r.dVT>0).map(r=>({
     id:uid(),mes,ano,tipo:'vrvt',funcId:r.func.id,funcNome:r.func.nome,funcEscala:r.func.escala,funcEmp:r.func.empresa||'',
@@ -3606,11 +3661,17 @@ async function salvarVRVTModal(){
   if(!novos.length){alert('Nenhum valor maior que zero para salvar!');return;}
 
   lancamentos.push(...novos);
+  // Salva local + tela IMEDIATAMENTE, antes de mexer no Firebase.
   lsL();
-  for(const l of novos){await fbSaveLanc(l);}
+  renderLanc();
   toast(`✅ ${novos.length} lançamento(s) VR/VT salvos — ${MESES[mes]}/${ano}!`,'g');
   showSavePopup(`${novos.length} lançamento(s) de VR/VT salvos — ${MESES[mes]}/${ano}!`);
   updateDash();
+  // Sincroniza com o Firebase em paralelo em segundo plano.
+  if(fbAvailable()){
+    Promise.all([...toDelete.map(l=>fbDeleteLanc(l.id)), ...novos.map(l=>fbSaveLanc(l))])
+      .catch(e=>console.error('[FB] erro ao sincronizar VR/VT:',e));
+  }
 }
 
 
@@ -5724,8 +5785,10 @@ function fillFaltaFuncSelect() {
   const selFiltro = $('fv-func-filt');
   const selModal  = $('mfv-func');
   const selEmp    = $('fv-emp-filt');
+  const selAno    = $('fv-ano-filt');
   if (!selFiltro || !selModal) return;
   const valFiltro = selFiltro.value, valModal = selModal.value, valEmp = selEmp ? selEmp.value : '';
+  const valAno = selAno ? selAno.value : '';
   const ordenados = [...funcionarios].sort((a,b) => (a.nome||'').localeCompare(b.nome||''));
   selFiltro.innerHTML = '<option value="">Todos os funcionários</option>' +
     ordenados.map(f => `<option value="${f.id}">${f.nome}</option>`).join('');
@@ -5737,6 +5800,15 @@ function fillFaltaFuncSelect() {
       empresas.map(e => `<option value="${e}">${e}</option>`).join('');
     selEmp.value = valEmp;
   }
+  if (selAno) {
+    const anosData = [...new Set(faltasValores.map(f => (f.data||'').slice(0,4)).filter(Boolean))];
+    const anoAtual = String(new Date().getFullYear());
+    if (!anosData.includes(anoAtual)) anosData.push(anoAtual);
+    anosData.sort();
+    selAno.innerHTML = '<option value="">Todos os anos</option>' +
+      anosData.map(a => `<option value="${a}">${a}</option>`).join('');
+    selAno.value = valAno;
+  }
   selFiltro.value = valFiltro;
   selModal.value = valModal;
 }
@@ -5746,9 +5818,13 @@ function renderFaltas() {
   if (!tb) return;
   const funcFilt = $('fv-func-filt') ? $('fv-func-filt').value : '';
   const empFilt  = $('fv-emp-filt') ? $('fv-emp-filt').value : '';
+  const mesFilt  = $('fv-mes-filt') ? $('fv-mes-filt').value : '';
+  const anoFilt  = $('fv-ano-filt') ? $('fv-ano-filt').value : '';
   let list = [...faltasValores].sort((a,b) => (b.data||'').localeCompare(a.data||''));
   if (funcFilt) list = list.filter(f => f.funcId === funcFilt);
   if (empFilt)  list = list.filter(f => (f.funcEmp||'') === empFilt);
+  if (mesFilt)  list = list.filter(f => f.data && String(parseInt(f.data.slice(5,7),10)) === mesFilt);
+  if (anoFilt)  list = list.filter(f => f.data && f.data.slice(0,4) === anoFilt);
 
   const totalValor = list.reduce((s,f) => s + (parseFloat(f.valor)||0), 0);
   const funcsUnicos = new Set(list.map(f => f.funcId)).size;
@@ -5760,8 +5836,8 @@ function renderFaltas() {
     tb.innerHTML = `<tr><td colspan="6">
       <div class="at-empty-state">
         <svg class="at-empty-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        <h3>${funcFilt||empFilt ? 'Nenhum resultado encontrado' : 'Nenhuma falta de valor registrada'}</h3>
-        <p>${funcFilt||empFilt ? 'Tente ajustar os filtros.' : 'Clique em "Novo Lançamento" para adicionar o primeiro registro.'}</p>
+        <h3>${funcFilt||empFilt||mesFilt||anoFilt ? 'Nenhum resultado encontrado' : 'Nenhuma falta de valor registrada'}</h3>
+        <p>${funcFilt||empFilt||mesFilt||anoFilt ? 'Tente ajustar os filtros.' : 'Clique em "Novo Lançamento" para adicionar o primeiro registro.'}</p>
       </div>
     </td></tr>`;
     return;
@@ -5837,16 +5913,27 @@ async function deleteFalta(faltaId) {
   toast('🗑️ Lançamento removido!', 'd');
 }
 
+const MESES_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+
 function gerarFichaFaltaPDF() {
   const funcId = $('fv-func-filt') ? $('fv-func-filt').value : '';
   if (!funcId) { alert('Selecione um funcionário no filtro para gerar a ficha!'); return; }
   const f = funcionarios.find(x => x.id === funcId);
   if (!f) { alert('Funcionário não encontrado!'); return; }
-  const lista = faltasValores.filter(x => x.funcId === funcId).sort((a,b) => (a.data||'').localeCompare(b.data||''));
-  if (!lista.length) { alert('Este funcionário não possui lançamentos de falta de valores.'); return; }
+  const mesFilt = $('fv-mes-filt') ? $('fv-mes-filt').value : '';
+  const anoFilt = $('fv-ano-filt') ? $('fv-ano-filt').value : '';
+  let lista = faltasValores.filter(x => x.funcId === funcId);
+  if (mesFilt) lista = lista.filter(x => x.data && String(parseInt(x.data.slice(5,7),10)) === mesFilt);
+  if (anoFilt) lista = lista.filter(x => x.data && x.data.slice(0,4) === anoFilt);
+  lista = lista.sort((a,b) => (a.data||'').localeCompare(b.data||''));
+  if (!lista.length) { alert('Este funcionário não possui lançamentos de falta de valores para o período selecionado.'); return; }
 
   const total = lista.reduce((s,x) => s + (parseFloat(x.valor)||0), 0);
   const hoje = new Date().toLocaleDateString('pt-BR');
+  let refLabel = '';
+  if (mesFilt && anoFilt) refLabel = `${MESES_PT[parseInt(mesFilt,10)-1]} / ${anoFilt}`;
+  else if (mesFilt) refLabel = MESES_PT[parseInt(mesFilt,10)-1];
+  else if (anoFilt) refLabel = anoFilt;
   const linhas = lista.map(x => {
     const dt = x.data ? new Date(x.data+'T00:00:00').toLocaleDateString('pt-BR', {day:'2-digit', month:'2-digit'}) : '—';
     return `<tr><td>${dt}</td><td>${x.descricao||''}</td><td class="num">-${fmt(x.valor)}</td></tr>`;
@@ -5862,6 +5949,8 @@ body{font-family:'Inter',Arial,sans-serif;color:#1e293b;background:#fff;font-siz
 .doc-title{font-size:16px;font-weight:800;color:#1e293b;letter-spacing:.4px;text-transform:uppercase}
 .func-line{margin-top:14px;font-size:13px}
 .func-line strong{color:#4f46e5}
+.ref-line{margin-top:6px;font-size:13px}
+.ref-line strong{color:#4f46e5}
 p.intro{margin:16px 0;text-align:justify;line-height:1.6;font-size:11.5px;color:#334155}
 table{width:100%;border-collapse:collapse;margin-top:6px}
 th{background:#f1f5f9;padding:8px 10px;font-size:10.5px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.4px;border:1px solid #cbd5e1;text-align:left}
@@ -5881,6 +5970,7 @@ td{padding:8px 10px;font-size:11.5px;border:1px solid #cbd5e1}
   <img src="logo.png" alt="Logo" onerror="this.style.display='none'">
   <div class="doc-title">Ficha de Registro de Falta de Valores</div>
   <div class="func-line"><strong>Funcionário:</strong> ${f.nome}${f.empresa ? ' — '+f.empresa : ''}</div>
+  ${refLabel ? `<div class="ref-line"><strong>Mês de Referência:</strong> ${refLabel}</div>` : ''}
 </div>
 <p class="intro">Este documento tem por finalidade registrar as divergências de valores identificadas no fechamento das vendas realizadas pelo funcionário acima mencionado. Os valores abaixo correspondem às faltas apuradas nas respectivas datas. Solicitamos que tenha uma atenção maior no fechamento do caixa para evitar divergências; caso continue a ocorrer, poderá ocorrer advertência ou suspensão.</p>
 <table>
@@ -6224,6 +6314,13 @@ function backupData(){
   toast('✅ Backup exportado com sucesso!');
 }
 
+// Impede fechar/recarregar a aba enquanto a sincronização com o Firebase
+// da importação ainda está em andamento (evita perder dados no meio do caminho).
+let _importSyncEmAndamento=false;
+window.addEventListener('beforeunload',(e)=>{
+  if(_importSyncEmAndamento){ e.preventDefault(); e.returnValue=''; return ''; }
+});
+
 async function importBackup(e){
   const file=e.target.files[0];if(!file)return;
   const reader=new FileReader();
@@ -6243,58 +6340,66 @@ Atestados: ${(data.atestados||[]).length}
 
 Deseja continuar?`)){e.target.value='';return;}
 
-      // Apply data
-      if(data.funcionarios){
-        for(const f of funcionarios){await fbDeleteFunc(f.id).catch(()=>{});}
-        funcionarios=data.funcionarios.map(f=>({status:'ativo',...f}));
-        lsF();
-        for(const f of funcionarios){await fbSaveFunc(f);}
-      }
-      if(data.lancamentos){
-        for(const l of lancamentos){await fbDeleteLanc(l.id).catch(()=>{});}
-        lancamentos=data.lancamentos;
-        lsL();
-        for(const l of lancamentos){await fbSaveLanc(l);}
-      }
-      if(data.encargos){
-        for(const enc of encargos){await fbDeleteEnc(enc.id).catch(()=>{});}
-        encargos=data.encargos;
-        lsE();
-        for(const enc of encargos){await fbSaveEnc(enc);}
-      }
-      if(data.creditos){
-        for(const cr of creditos){await fbDeleteCred(cr.id).catch(()=>{});}
-        creditos=data.creditos;
-        lsCr();
-        for(const cr of creditos){await fbSaveCred(cr);}
-      }
-      if(data.config){
-        config={...config,...data.config};
-        saveC();applyConfig();
-      }
+      // 1) Aplica os dados localmente (memória + localStorage) e atualiza a tela
+      //    IMEDIATAMENTE — assim, mesmo que a sincronização com o Firebase demore
+      //    ou falhe, você já vê e não perde o que foi importado nesta aba/dispositivo.
+      const funcionariosAntigos=funcionarios, lancamentosAntigos=lancamentos,
+            encargosAntigos=encargos, creditosAntigos=creditos, atestadosAntigos=atestados;
 
-      if(data.atestados){
-        for(const a of atestados){await fbDeleteAt(a.id).catch(()=>{});}
-        atestados=data.atestados;
-        lsAt();
-        for(const a of atestados){await fbSaveAt(a);}
-      }
+      if(data.funcionarios){ funcionarios=data.funcionarios.map(f=>({status:'ativo',...f})); lsF(); }
+      if(data.lancamentos){ lancamentos=data.lancamentos; lsL(); }
+      if(data.encargos){ encargos=data.encargos; lsE(); }
+      if(data.creditos){ creditos=data.creditos; lsCr(); }
+      if(data.config){ config={...config,...data.config}; saveC(); applyConfig(); }
+      if(data.atestados){ atestados=data.atestados; lsAt(); }
+
       renderFunc();renderLanc();updateDash();fillCalcFilters();fillLancFilters();fillFolhaEmpFilter();renderEncargos();renderCredito();renderAtestados();
 
       const res=$('bk-import-res');
       if(res){
         res.style.display='block';
-        res.innerHTML=`✅ <strong>Backup importado com sucesso!</strong><br>
+        res.innerHTML=`✅ <strong>Backup importado!</strong> Sincronizando com a nuvem, não feche esta aba…<br>
           Funcionários: <strong>${funcionarios.length}</strong> &nbsp;|&nbsp;
           Lançamentos: <strong>${lancamentos.length}</strong>`;
-        setTimeout(()=>{res.style.display='none';},6000);
       }
-      toast(`✅ Backup importado: ${funcionarios.length} func. / ${lancamentos.length} lanç.`,'g');
+      toast(`✅ Backup carregado: ${funcionarios.length} func. / ${lancamentos.length} lanç. Sincronizando…`,'g');
+      e.target.value='';
+
+      // 2) Sincroniza com o Firebase em segundo plano usando gravação em LOTE
+      //    (writeBatch), muito mais rápida e confiável do que apagar/gravar
+      //    documento por documento. Enquanto isso roda, avisamos para não
+      //    fechar a aba (beforeunload) e mostramos progresso.
+      if(fbAvailable()){
+        _importSyncEmAndamento=true;
+        const resultados=await Promise.all([
+          data.funcionarios? fbBatchSync('funcionarios', funcionariosAntigos, funcionarios) : Promise.resolve({ok:true}),
+          data.lancamentos ? fbBatchSync('lancamentos', lancamentosAntigos, lancamentos) : Promise.resolve({ok:true}),
+          data.encargos    ? fbBatchSync('encargos', encargosAntigos, encargos) : Promise.resolve({ok:true}),
+          data.creditos    ? fbBatchSync('creditos', creditosAntigos, creditos) : Promise.resolve({ok:true}),
+          data.atestados   ? fbBatchSync('atestados', atestadosAntigos, atestados) : Promise.resolve({ok:true}),
+        ]);
+        _importSyncEmAndamento=false;
+        const falhas=resultados.filter(r=>!r.ok);
+        if(falhas.length){
+          toast('⚠️ Backup ficou salvo neste dispositivo, mas houve erro ao sincronizar com a nuvem: '+falhas.map(f=>f.motivo).join(', '),'d');
+          if(res) res.innerHTML+=`<br>⚠️ <strong>Atenção:</strong> falha ao sincronizar com a nuvem. Os dados estão salvos neste aparelho — tente novamente com internet estável antes de usar em outro dispositivo.`;
+        } else {
+          toast('☁️ Sincronizado com a nuvem com sucesso!','g');
+          if(res){ res.innerHTML=`✅ <strong>Backup importado e sincronizado com sucesso!</strong><br>
+            Funcionários: <strong>${funcionarios.length}</strong> &nbsp;|&nbsp;
+            Lançamentos: <strong>${lancamentos.length}</strong>`;
+            setTimeout(()=>{res.style.display='none';},6000);
+          }
+        }
+      } else {
+        if(res) res.innerHTML+=`<br>📴 Firebase offline — dados salvos apenas neste dispositivo por enquanto.`;
+      }
     }catch(err){
+      _importSyncEmAndamento=false;
       alert('Erro ao importar backup: '+err.message);
       console.error(err);
+      e.target.value='';
     }
-    e.target.value='';
   };
   reader.readAsText(file);
 }
